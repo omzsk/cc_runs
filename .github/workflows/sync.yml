@@ -1,4 +1,4 @@
-name: Mirror GitHub / Forgejo / GitLab to Codeberg (with backups)
+name: OZ Mirror
 
 on:
   workflow_dispatch:
