@@ -89,7 +89,8 @@ def parse_entry(raw: str, line_number: int) -> dict | None:
         missing = ", ".join(flag for flag in FLAGS if flag not in values)
         raise error(f"missing option(s): {missing}")
 
-    target = f"{repo}_{owner.lower()}"
+    # target = f"{repo}_{owner.lower()}"
+    target = f"{repo}_{owner}"
     # These exact keys are consumed by .github/workflows/sync.yml.
     return {"source": url, "target": target, **{flag: values[flag] for flag in FLAGS}}
 

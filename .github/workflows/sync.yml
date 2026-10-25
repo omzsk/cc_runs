@@ -3,7 +3,7 @@ name: Mirror GitHub / Forgejo / GitLab to Codeberg (with backups)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '23 */3 * * *' # Every 3 hours, UTC. Edit as needed.
+    - cron: '23 */6 * * *' # Every 6 hours, UTC. Edit as needed.
 
 permissions:
   contents: read
