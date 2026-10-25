@@ -1,213 +1,368 @@
 #!/usr/bin/env bash
-# Synchronize one upstream Git repo and optional wiki to Codeberg.
-# Disappearing / rewritten destination history is first kept as immutable backup tags.
+# Mirror an HTTPS upstream repository (and optionally its Wiki) to Codeberg.
+# Before replacing/deleting destination refs, archive their old Git objects as
+# immutable tags: refs/tags/__mirror_backup__/<run>/branches|tags/<name>.
+# Requires: Bash 4+, git, curl, jq; git-lfs only when LFS options are enabled.
+# NOTE: this is a one-way mirror. Never edit the Codeberg copy directly.
 set -euo pipefail
 
-: "${SOURCE_URL:?Required: SOURCE_URL}"
+: "${SOURCE_URL:?Required: SOURCE_URL (public HTTPS clone URL)}"
 : "${DEST_PATH:?Required: DEST_PATH (owner/repository)}"
-: "${CODEBERG_USERNAME:?Required: GitHub variable CODEBERG_USERNAME}"
-: "${CODEBERG_TOKEN:?Required: GitHub secret CODEBERG_TOKEN}"
+: "${CODEBERG_USERNAME:?Required: CODEBERG_USERNAME}"
+: "${CODEBERG_TOKEN:?Required: CODEBERG_TOKEN}"
 
 WITH_LFS="${WITH_LFS:-false}"
 WITH_WIKI="${WITH_WIKI:-false}"
 WITH_WIKI_LFS="${WITH_WIKI_LFS:-false}"
+CREATE_PRIVATE="${CREATE_PRIVATE:-false}"
 BACKUP_PREFIX='__mirror_backup__'
+API_URL='https://codeberg.org/api/v1'
 
-if [[ ! "$DEST_PATH" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-  echo "Invalid DEST_PATH; use Codeberg owner/repo only: $DEST_PATH" >&2
-  exit 2
-fi
-if [[ ! "$SOURCE_URL" == https://* ]]; then
-  echo 'SOURCE_URL must be a public HTTPS Git clone URL (no credentials).' >&2
-  exit 2
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+notice() { printf '%s\n' "$*" >&2; }
+check_https_url() {
+  local url="$1" server
+  [[ "$url" == https://* ]] || fail 'Upstream URL must use HTTPS.'
+  server="${url#https://}"
+  server="${server%%/*}"
+  [[ -n "$server" && "$server" != *'@'* && "$url" != *[[:space:]]* ]] ||
+    fail 'Upstream HTTPS URL must not contain credentials or whitespace.'
+}
+
+[[ "$DEST_PATH" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "Invalid DEST_PATH: $DEST_PATH"
+for option in WITH_LFS WITH_WIKI WITH_WIKI_LFS CREATE_PRIVATE; do
+  value="${!option}"
+  [[ "$value" == true || "$value" == false ]] || fail "$option must be true or false"
+done
+check_https_url "$SOURCE_URL"
+for bin in git curl jq; do command -v "$bin" >/dev/null 2>&1 || fail "Missing command: $bin"; done
+if [[ "$WITH_LFS" == true || ( "$WITH_WIKI" == true && "$WITH_WIKI_LFS" == true ) ]]; then
+  git lfs version >/dev/null 2>&1 || fail 'Git LFS is required but not installed.'
 fi
 
-# Credentials never occur in a remote URL or a process command line.
-# CODEBERG_USERNAME can differ from DEST_PATH owner (org repositories).
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf -- "$WORK"' EXIT
+umask 077
 cat > "$WORK/askpass" <<'ASKPASS'
 #!/usr/bin/env bash
-case "$1" in
+case "${1:-}" in
   *Username*) printf '%s\n' "$CODEBERG_USERNAME" ;;
   *Password*) printf '%s\n' "$CODEBERG_TOKEN" ;;
   *) exit 1 ;;
 esac
 ASKPASS
 chmod 700 "$WORK/askpass"
-# Only destination operations get the Codeberg token. The upstream repository
-# and its LFS endpoint must NEVER receive this credential.
+printf 'Authorization: token %s\n' "$CODEBERG_TOKEN" > "$WORK/api-header"
+
+# Credentials are NOT embedded in remote URLs or in shell command arguments.
+# Only operations explicitly wrapped in cb_git use the Codeberg askpass script.
 cb_git() { GIT_ASKPASS="$WORK/askpass" git "$@"; }
-export GIT_TERMINAL_PROMPT=0
-export GIT_LFS_SKIP_SMUDGE=1
+export GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1
+TARGET_URL="${TARGET_URL_OVERRIDE:-https://codeberg.org/${DEST_PATH}.git}"
+TARGET_WIKI_URL="${TARGET_WIKI_URL_OVERRIDE:-https://codeberg.org/${DEST_PATH}.wiki.git}"
+# Local integration tests may supply file:// or pathname overrides; in this
+# mode no Codeberg API is called, and destination repositories must exist.
+API_ENABLED=true
+[[ -z "${TARGET_URL_OVERRIDE:-}" && -z "${TARGET_WIKI_URL_OVERRIDE:-}" ]] || API_ENABLED=false
 
-TARGET_URL="https://codeberg.org/${DEST_PATH}.git"
-TARGET_WIKI_URL="https://codeberg.org/${DEST_PATH}.wiki.git"
-# These optional overrides are for local integration testing only.
-TARGET_URL="${TARGET_URL_OVERRIDE:-$TARGET_URL}"
-TARGET_WIKI_URL="${TARGET_WIKI_URL_OVERRIDE:-$TARGET_WIKI_URL}"
-
-# Return the symref name pointed to by the remote HEAD, if advertised.
-remote_default_branch() {
-  cb_git ls-remote --symref "$1" HEAD | awk '$1 == "ref:" && $3 == "HEAD" {sub(/^refs\/heads\//, "", $2); print $2; exit}'
+api_request() {
+  local method="$1" path="$2" body="${3:-}" status
+  local -a args=(--silent --show-error --connect-timeout 15 --max-time 90
+    --header "@$WORK/api-header" --header 'Accept: application/json'
+    --header 'Content-Type: application/json' --output "$WORK/api-response.json"
+    --write-out '%{http_code}' --request "$method")
+  [[ -z "$body" ]] || args+=(--data-binary "@$body")
+  status="$(curl "${args[@]}" "$API_URL/$path")" || fail "HTTP transport error: $method $path"
+  API_STATUS="$status"
 }
-
-mirror_git() {
-  local kind="$1" src="$2" dest="$3" lfs="$4"
-  local repo_dir="$WORK/${kind}.git" remote_branch local_branch old new backup
-  local stamp="$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-  local -a destination_heads=() destination_tags=() backup_specs=() deleted_tags=()
-  local dest_ref tag
-
-  echo "::group::Mirror $kind: $src -> $dest"
-  git clone --bare -- "$src" "$repo_dir"
-  (
-    cd "$repo_dir"
-    git remote add codeberg "$dest"
-    # Repositories that are accidentally empty must not erase a valid destination.
-    if [[ -z "$(git for-each-ref --format='%(refname)' refs/heads)" ]]; then
-      echo "ERROR: Upstream $kind has no branches; refusing destructive sync." >&2
-      exit 1
-    fi
-
-    # 1) LFS already referenced by the UPSTREAM, including older commits.
-    # Do this before adding destination-only refs, otherwise --all might ask
-    # the source for LFS objects that ONLY exist at Codeberg.
-    if [[ "$lfs" == 'true' ]]; then
-      echo 'Fetching upstream LFS history...'
-      git lfs fetch --all origin
-    fi
-
-    # 2) Collect ALL destination heads and tags (including previous backup tags).
-    # Keep their object histories in this temporary clone for preservation.
-    cb_git fetch --no-tags codeberg \
-      '+refs/heads/*:refs/destination/heads/*' \
-      '+refs/tags/*:refs/destination/tags/*'
-
-    mapfile -t destination_heads < <(git for-each-ref --format='%(refname)' refs/destination/heads)
-    mapfile -t destination_tags < <(git for-each-ref --format='%(refname)' refs/destination/tags)
-
-    # 3) Fetch old LFS data FROM CODEBERG before deleting/replacing refs.
-    # Crucial: old commits may no longer be reachable/available upstream.
-    if [[ "$lfs" == 'true' ]] && (( ${#destination_heads[@]} + ${#destination_tags[@]} > 0 )); then
-      echo 'Fetching existing Codeberg LFS history and previous backups...'
-      printf '%s\n' "${destination_heads[@]}" "${destination_tags[@]}" | cb_git lfs fetch --all codeberg --stdin
-    fi
-
-    # Reserve our backup prefix so upstream cannot overwrite our archives.
-    if [[ -n "$(git for-each-ref --format='%(refname)' "refs/tags/${BACKUP_PREFIX}")" ]]; then
-      echo "ERROR: Upstream already has tags under reserved ${BACKUP_PREFIX}/ prefix." >&2
-      exit 1
-    fi
-
-    # Special case: GitLab Wiki default branch is often main, Codeberg Wiki
-    # is often master. Map upstream HEAD to destination HEAD so pages render.
-    if [[ "$kind" == 'wiki' ]]; then
-      local src_head dst_head src_oid
-      src_head="$(git symbolic-ref -q --short HEAD || true)"
-      dst_head="$(remote_default_branch codeberg)"
-      if [[ -n "$src_head" && -n "$dst_head" && "$src_head" != "$dst_head" ]]; then
-        if git show-ref --verify --quiet "refs/heads/$dst_head"; then
-          echo "ERROR: Wiki upstream has both '$src_head' and '$dst_head'; branch mapping ambiguous." >&2
-          exit 1
-        fi
-        src_oid="$(git rev-parse "refs/heads/$src_head")"
-        git update-ref "refs/heads/$dst_head" "$src_oid"
-        git update-ref -d "refs/heads/$src_head"
-        echo "Mapped Wiki default branch $src_head -> $dst_head for Codeberg display."
-      fi
-    fi
-
-    # 4) Archive any branch about to be DELETED or NON-FAST-FORWARD changed.
-    # Normal fast-forwards do not need a backup (old commits remain reachable).
-    for dest_ref in "${destination_heads[@]}"; do
-      old="$(git rev-parse "$dest_ref")"
-      remote_branch="${dest_ref#refs/destination/heads/}"
-      local_branch="refs/heads/$remote_branch"
-      if git show-ref --verify --quiet "$local_branch"; then
-        new="$(git rev-parse "$local_branch")"
-        if git merge-base --is-ancestor "$old" "$new"; then
-          continue
-        fi
-      fi
-      backup="refs/tags/${BACKUP_PREFIX}/${stamp}/branches/${remote_branch}"
-      git update-ref "$backup" "$old"
-      backup_specs+=("$backup:$backup")
-      echo "Backup branch: $remote_branch (old=$old)"
-    done
-
-    # Archive tags that were deleted or changed, preserving annotated tag objects.
-    # Previously generated backup tags are permanent, and never pruned.
-    for dest_ref in "${destination_tags[@]}"; do
-      tag="${dest_ref#refs/destination/tags/}"
-      [[ "$tag" == "${BACKUP_PREFIX}/"* ]] && continue
-      old="$(git rev-parse "$dest_ref")"
-      if git show-ref --verify --quiet "refs/tags/$tag"; then
-        [[ "$old" == "$(git rev-parse "refs/tags/$tag")" ]] && continue
-      else
-        deleted_tags+=(":refs/tags/$tag")
-      fi
-      backup="refs/tags/${BACKUP_PREFIX}/${stamp}/tags/${tag}"
-      git update-ref "$backup" "$old"
-      backup_specs+=("$backup:$backup")
-      echo "Backup tag: $tag (old=$old)"
-    done
-
-    # 5) Upload all LFS objects for active source refs + new backup tags.
-    # Fail BEFORE rewriting any Git refs if LFS transfer fails.
-    if [[ "$lfs" == 'true' ]]; then
-      echo 'Uploading live + archived Git LFS objects to Codeberg...'
-      cb_git lfs push --all codeberg
-    fi
-
-    # 6) Commit backups to Codeberg FIRST. Abort on error (no force-push yet).
-    if (( ${#backup_specs[@]} > 0 )); then
-      cb_git push codeberg "${backup_specs[@]}"
-    fi
-
-    # 7) Synchronize live branches. --prune removes deleted upstream branches;
-    # leading + handles force-push/rebase. Backup tags remain untouched.
-    cb_git push --prune codeberg '+refs/heads/*:refs/heads/*'
-
-    # 8) Update tags and explicitly delete old live tags only.
-    # NEVER prune backup tags; old backups fetched into refs/destination/tags.
-    cb_git push codeberg '+refs/tags/*:refs/tags/*'
-    if (( ${#deleted_tags[@]} > 0 )); then
-      cb_git push codeberg "${deleted_tags[@]}"
-    fi
-
-    echo "DONE: $kind; created ${#backup_specs[@]} backup tag(s)."
-    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-      printf -- '- **%s** `%s` → `%s`: %s new backup tag(s); LFS=%s\n' \
-        "$kind" "$src" "$dest" "${#backup_specs[@]}" "$lfs" >> "$GITHUB_STEP_SUMMARY"
-    fi
-  )
-  echo '::endgroup::'
+api_expect() {
+  local expected="$1" action="$2"
+  if [[ "$API_STATUS" != "$expected" ]]; then
+    notice "API $action failed (HTTP $API_STATUS):"
+    cat "$WORK/api-response.json" >&2 || true
+    fail "$action"
+  fi
 }
-
-mirror_git 'repository' "$SOURCE_URL" "$TARGET_URL" "$WITH_LFS"
-
-if [[ "$WITH_WIKI" == 'true' ]]; then
-  # Standard GitHub, Forgejo, GitLab wiki clone URLs: <repo>.wiki.git.
-  clean_source="${SOURCE_URL%/}"
-  clean_source="${clean_source%.git}"
-  source_wiki="${SOURCE_WIKI_URL:-${clean_source}.wiki.git}"
-
-  # A repository may not have a Wiki at all. Never wipe an existing Codeberg
-  # Wiki when a source Wiki is missing or inaccessible.
-  if git ls-remote "$source_wiki" HEAD >/dev/null 2>&1; then
-    echo "Source wiki found: $source_wiki"
-    # Codeberg Wiki must be enabled + initialized (create one Home page).
-    if ! cb_git ls-remote "$TARGET_WIKI_URL" HEAD >/dev/null 2>&1; then
-      echo "ERROR: Destination Wiki missing/inaccessible: $TARGET_WIKI_URL" >&2
-      echo 'Enable Codeberg Wiki and create an initial Home page, then retry.' >&2
-      exit 1
-    fi
-    mirror_git 'wiki' "$source_wiki" "$TARGET_WIKI_URL" "$WITH_WIKI_LFS"
+repo_api_path="repos/$DEST_PATH"
+load_repo() {
+  api_request GET "$repo_api_path"
+  api_expect 200 "Read Codeberg repository $DEST_PATH"
+  cp "$WORK/api-response.json" "$WORK/repo.json"
+}
+ensure_repository() {
+  local owner="${DEST_PATH%%/*}" name="${DEST_PATH#*/}" endpoint
+  [[ "$API_ENABLED" == true ]] || return 0
+  api_request GET "$repo_api_path"
+  case "$API_STATUS" in
+    200) notice "Codeberg repository exists: $DEST_PATH"; return 0 ;;
+    404) notice "Creating Codeberg repository: $DEST_PATH" ;;
+    *) api_expect 200 'Check repository permissions' ;;
+  esac
+  if [[ "${owner,,}" == "${CODEBERG_USERNAME,,}" ]]; then
+    endpoint='user/repos'
   else
-    echo "::warning::Wiki absent/inaccessible at $source_wiki; no Wiki changes made."
+    endpoint="orgs/$owner/repos"
+  fi
+  jq -n --arg name "$name" --argjson private "$CREATE_PRIVATE" \
+    '{name:$name, private:$private, auto_init:false}' > "$WORK/create-repo.json"
+  api_request POST "$endpoint" "$WORK/create-repo.json"
+  api_expect 201 "Create repository $DEST_PATH (token must have create permission)"
+  notice "Created https://codeberg.org/$DEST_PATH"
+}
+
+# For a repo created in Codeberg, enable its Wiki and create a minimal Home
+# page when the separate wiki.git does not yet have any Git branches.
+ensure_wiki() {
+  local wanted="$1" current_refs
+  [[ "$API_ENABLED" == true ]] || return 0
+  load_repo
+  if jq -e '.external_wiki != null' "$WORK/repo.json" >/dev/null; then
+    fail 'Destination uses an external Wiki; refusing to replace its configuration.'
+  fi
+  if [[ "$(jq -r '.has_wiki // false' "$WORK/repo.json")" != true ]]; then
+    notice 'Enabling Codeberg Wiki...'
+    printf '{"has_wiki":true}\n' > "$WORK/wiki-settings.json"
+    api_request PATCH "$repo_api_path" "$WORK/wiki-settings.json"
+    api_expect 200 'Enable Wiki'
+  fi
+
+  # Checking --heads (rather than HEAD) works with a repository whose HEAD is
+  # not yet advertised. Authentication failures must not be mistaken for empty.
+  if current_refs="$(cb_git ls-remote --heads "$TARGET_WIKI_URL" 2>"$WORK/wiki-ls-error")"; then
+    if [[ -n "$current_refs" ]]; then
+      notice 'Destination Wiki already initialized.'
+      return 0
+    fi
+  else
+    notice 'Wiki Git remote not initialized yet; trying Wiki creation API.'
+  fi
+
+  # Set the Wiki branch BEFORE creating its first commit. Forgejo uses the
+  # configured Wiki branch when initializing its separate bare Git repo.
+  jq -n --arg branch "$wanted" '{wiki_branch:$branch}' > "$WORK/wiki-branch-init.json"
+  api_request PATCH "$repo_api_path" "$WORK/wiki-branch-init.json"
+  api_expect 200 'Configure initial Wiki branch'
+  notice 'Initializing Codeberg Wiki Home page via API...'
+  jq -n --arg body $'# Home\n\nInitial page for Wiki mirroring.\n' \
+    '{title:"Home",content_base64:($body|@base64),message:"Initialize Wiki for mirror"}' \
+    > "$WORK/wiki-home.json"
+  api_request POST "$repo_api_path/wiki/new" "$WORK/wiki-home.json"
+  case "$API_STATUS" in
+    200|201) ;;
+    *) notice "Wiki initialization HTTP $API_STATUS:"; cat "$WORK/api-response.json" >&2; fail 'Initialize Wiki' ;;
+  esac
+  cb_git ls-remote --exit-code --heads "$TARGET_WIKI_URL" >/dev/null ||
+    fail 'Wiki API succeeded but Wiki Git remote has no branches.'
+}
+
+# Determine the source default HEAD ref; if missing, use the first source head.
+source_default_branch() {
+  local head
+  head="$(git symbolic-ref -q --short HEAD || true)"
+  if [[ -n "$head" ]] && git show-ref -q --verify "refs/heads/$head"; then
+    printf '%s\n' "$head"
+  else
+    git for-each-ref --format='%(refname:strip=2)' refs/heads | head -n 1
+  fi
+}
+
+# After the desired branch has been pushed, change the branch shown by Codeberg
+# BEFORE trying to delete its previous default branch.
+set_destination_default() {
+  local kind="$1" wanted="$2" field current
+  [[ "$API_ENABLED" == true ]] || return 0
+  load_repo
+  if [[ "$kind" == wiki ]]; then field='wiki_branch'; else field='default_branch'; fi
+  current="$(jq -r --arg field "$field" '.[$field] // ""' "$WORK/repo.json")"
+  if [[ "$wanted" == "$current" ]]; then return 0; fi
+  notice "Changing Codeberg $field from '${current:-<unset>}' to '$wanted'..."
+  jq -n --arg field "$field" --arg branch "$wanted" '{($field):$branch}' > "$WORK/default-branch.json"
+  api_request PATCH "$repo_api_path" "$WORK/default-branch.json"
+  api_expect 200 "Change $field to $wanted"
+  load_repo
+  current="$(jq -r --arg field "$field" '.[$field] // ""' "$WORK/repo.json")"
+  [[ "$current" == "$wanted" ]] || fail "Codeberg did not accept $field=$wanted"
+}
+
+# Push with an exact object-ID lease for EVERY destination ref, including new
+# refs (empty lease). This rejects concurrent writes without silently erasing
+# commits or tags which were not included in our backup snapshot.
+mirror_git() (
+  local kind="$1" src="$2" dest="$3" lfs="$4"
+  local repo_dir="$WORK/${kind}.git" old new name ref archive current default
+  local stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$-$RANDOM"
+  local -a src_heads=() src_tags=() dst_heads=() dst_tags=()
+  local -a backup_specs=() backup_leases=() update_specs=() update_leases=()
+  local -a delete_specs=() delete_leases=()
+  local -A old_heads=() old_tags=()
+  local backups=0
+
+  notice "::group::Mirror $kind: $src -> $dest"
+  git clone --bare -- "$src" "$repo_dir"
+  cd "$repo_dir"
+  git remote add codeberg "$dest"
+  mapfile -t src_heads < <(git for-each-ref --format='%(refname)' refs/heads)
+  (( ${#src_heads[@]} > 0 )) || fail "Upstream $kind has no branches. No destination refs changed."
+  mapfile -t src_tags < <(git for-each-ref --format='%(refname)' refs/tags)
+  if git for-each-ref --format='%(refname)' refs/tags | grep -q -E "^refs/tags/${BACKUP_PREFIX}(/|$)"; then
+    fail "Upstream has tags under reserved name: $BACKUP_PREFIX"
+  fi
+  default="$(source_default_branch)"
+  notice "Upstream $kind default branch: $default"
+
+  # Download source LFS FIRST, before adding any Codeberg-only refs locally.
+  if [[ "$lfs" == true ]]; then
+    notice 'Fetching source LFS history...'
+    git lfs fetch --all origin
+  fi
+
+  if [[ "$kind" == repository ]]; then
+    ensure_repository
+  else
+    ensure_wiki "$default"
+  fi
+
+  # Fetch destination branches and tags into a separate namespace so source
+  # refs remain untouched, including annotated tag objects.
+  cb_git fetch --no-tags codeberg \
+    '+refs/heads/*:refs/destination/heads/*' \
+    '+refs/tags/*:refs/destination/tags/*'
+  while read -r ref old; do
+    [[ -n "${ref:-}" ]] || continue
+    name="${ref#refs/destination/heads/}"
+    dst_heads+=("$name")
+    old_heads["$name"]="$old"
+  done < <(git for-each-ref --format='%(refname) %(objectname)' refs/destination/heads)
+  while read -r ref old; do
+    [[ -n "${ref:-}" ]] || continue
+    name="${ref#refs/destination/tags/}"
+    dst_tags+=("$name")
+    old_tags["$name"]="$old"
+  done < <(git for-each-ref --format='%(refname) %(objectname)' refs/destination/tags)
+
+  # Previous backups can refer to LFS objects unavailable at the source.
+  if [[ "$lfs" == true && $(( ${#dst_heads[@]} + ${#dst_tags[@]} )) -gt 0 ]]; then
+    notice 'Fetching destination LFS history, including previous backups...'
+    {
+      for name in "${dst_heads[@]}"; do printf 'refs/destination/heads/%s\n' "$name"; done
+      for name in "${dst_tags[@]}"; do printf 'refs/destination/tags/%s\n' "$name"; done
+    } | cb_git -c "lfs.url=${dest%/}/info/lfs" lfs fetch --all codeberg --stdin
+  fi
+
+  # Archive changed/deleted destination branches, except fast-forwards.
+  for name in "${dst_heads[@]}"; do
+    old="${old_heads[$name]}"
+    if git show-ref -q --verify "refs/heads/$name"; then
+      new="$(git rev-parse "refs/heads/$name")"
+      if git merge-base --is-ancestor "$old" "$new"; then continue; fi
+    fi
+    archive="refs/tags/$BACKUP_PREFIX/$stamp/branches/$name"
+    git update-ref "$archive" "$old"
+    backup_specs+=("$archive:$archive")
+    backup_leases+=("--force-with-lease=$archive:")
+    ((backups+=1))
+    notice "Archived previous branch: $name ($old)"
+  done
+
+  # Back up changed/deleted annotated OR lightweight tags.
+  for name in "${dst_tags[@]}"; do
+    [[ "$name" == "$BACKUP_PREFIX/"* ]] && continue
+    old="${old_tags[$name]}"
+    if git show-ref -q --verify "refs/tags/$name" &&
+       [[ "$old" == "$(git rev-parse "refs/tags/$name")" ]]; then
+      continue
+    fi
+    archive="refs/tags/$BACKUP_PREFIX/$stamp/tags/$name"
+    git update-ref "$archive" "$old"
+    backup_specs+=("$archive:$archive")
+    backup_leases+=("--force-with-lease=$archive:")
+    ((backups+=1))
+    notice "Archived previous tag: $name ($old)"
+  done
+
+  # Upload LFS while live Git refs are still intact. With --all, active source
+  # refs and newly created backup tags are included.
+  if [[ "$lfs" == true ]]; then
+    notice 'Uploading source and archived LFS to Codeberg...'
+    cb_git -c "lfs.url=${dest%/}/info/lfs" lfs push --all codeberg
+  fi
+
+  # First publish immutable backup refs; never force-replace a prior backup.
+  if (( ${#backup_specs[@]} > 0 )); then
+    cb_git push --atomic "${backup_leases[@]}" codeberg "${backup_specs[@]}"
+  fi
+
+  # Publish ALL desired upstream branches, safely leased to the snapshot.
+  # Do not prune yet; destination's old default might need to be changed first.
+  for ref in "${src_heads[@]}"; do
+    name="${ref#refs/heads/}"
+    update_specs+=("+$ref:$ref")
+    update_leases+=("--force-with-lease=$ref:${old_heads[$name]:-}")
+  done
+  cb_git push --atomic "${update_leases[@]}" codeberg "${update_specs[@]}"
+
+  # Changing the default is only possible after the wanted branch exists.
+  set_destination_default "$kind" "$default"
+
+  # Some forges may report a new default in their API while the bare Git
+  # remote still advertises the old HEAD. Never attempt to delete that HEAD.
+  local advertised_head
+  advertised_head="$(cb_git ls-remote --symref codeberg HEAD | awk '$1 == "ref:" && $3 == "HEAD" {sub(/^refs\/heads\//, "", $2); print $2; exit}')"
+
+  # Prune only previous destination heads absent from the source.
+  for name in "${dst_heads[@]}"; do
+    if ! git show-ref -q --verify "refs/heads/$name"; then
+      if [[ "$name" == "$advertised_head" ]]; then
+        notice "::warning::Not deleting $kind/$name: destination Git HEAD still points to it."
+        continue
+      fi
+      ref="refs/heads/$name"
+      delete_specs+=(":$ref")
+      delete_leases+=("--force-with-lease=$ref:${old_heads[$name]}")
+    fi
+  done
+  # Sync source tags without touching any destination backup archive.
+  for ref in "${src_tags[@]}"; do
+    name="${ref#refs/tags/}"
+    delete_specs+=("+$ref:$ref")
+    delete_leases+=("--force-with-lease=$ref:${old_tags[$name]:-}")
+  done
+  for name in "${dst_tags[@]}"; do
+    [[ "$name" == "$BACKUP_PREFIX/"* ]] && continue
+    if ! git show-ref -q --verify "refs/tags/$name"; then
+      ref="refs/tags/$name"
+      delete_specs+=(":$ref")
+      delete_leases+=("--force-with-lease=$ref:${old_tags[$name]}")
+    fi
+  done
+  if (( ${#delete_specs[@]} > 0 )); then
+    cb_git push --atomic "${delete_leases[@]}" codeberg "${delete_specs[@]}"
+  fi
+
+  notice "DONE: $kind, created $backups new immutable backup tag(s)."
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    printf -- '- **%s** `%s` -> `%s`: %s backup tag(s); LFS=%s\n' \
+      "$kind" "$src" "$dest" "$backups" "$lfs" >> "$GITHUB_STEP_SUMMARY"
+  fi
+  notice '::endgroup::'
+)
+
+mirror_git repository "$SOURCE_URL" "$TARGET_URL" "$WITH_LFS"
+
+if [[ "$WITH_WIKI" == true ]]; then
+  source_root="${SOURCE_URL%/}"
+  source_root="${source_root%.git}"
+  source_wiki="${SOURCE_WIKI_URL:-${source_root}.wiki.git}"
+  check_https_url "$source_wiki"
+  # A Wiki may have branches without an advertised symbolic HEAD.
+  if wiki_refs="$(git ls-remote --heads "$source_wiki" 2>/dev/null)" && [[ -n "$wiki_refs" ]]; then
+    notice "Source Wiki found: $source_wiki"
+    mirror_git wiki "$source_wiki" "$TARGET_WIKI_URL" "$WITH_WIKI_LFS"
+  else
+    notice "::warning::Source Wiki missing, empty, or inaccessible: $source_wiki; destination Wiki left untouched."
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-      printf -- '- **wiki**: absent or inaccessible at `%s`; skipped (no destination changes).\n' "$source_wiki" >> "$GITHUB_STEP_SUMMARY"
+      printf -- '- **wiki**: source absent/empty/inaccessible; destination Wiki untouched.\n' >> "$GITHUB_STEP_SUMMARY"
     fi
   fi
 fi
