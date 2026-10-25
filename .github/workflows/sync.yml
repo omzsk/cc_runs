@@ -1,0 +1,165 @@
+name: Mirror GitHub / Forgejo / GitLab to Codeberg (with backups)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */3 * * *' # Every 3 hours, UTC. Edit as needed.
+
+permissions:
+  contents: read
+
+# Prevent overlapping sync runs (including manual runs).
+concurrency:
+  group: codeberg-mirror-all
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Add more source/target pairs here. Targets must ALREADY exist on Codeberg.
+          # Public, HTTPS-clonable GitHub repository:
+          - source: https://github.com/R0rt1z2/kaeru.git
+            target: ozsx/kaeru
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/shomykohai/mtk-payloads.git
+            target: ozsx/mtk-payloads
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/shomykohai/penumbra.git
+            target: ozsx/penumbra
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/bkerler/mtkclient.git
+            target: ozsx/mtkclient
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://git.kaerulabs.com/shomy/preloader-mtk.git
+            target: ozsx/preloader-mtk
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/shomykohai/hacc.git
+            target: ozsx/hacc
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+          #######################################################
+          #######################################################
+          - source: https://github.com/tiann/KernelSU.git
+            target: ozsx/KernelSU
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/5ec1cff/KernelSU.git
+            target: ozsx/KernelSU_5ec1cff
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/backslashxx/KernelSU
+            target: ozsx/KernelSU_backslashxx
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/KOWX712/KernelSU.git
+            target: ozsx/KowSU
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/JingMatrix/KernelSU.git
+            target: ozsx/KernelSU_JMT
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/JingMatrix/NeoZygisk.git
+            target: ozsx/NeoZygisk
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/JingMatrix/TEESimulator.git
+            target: ozsx/TEESimulator
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/JingMatrix/Vector.git
+            target: ozsx/Vector
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/JingMatrix/LSPatch.git
+            target: ozsx/LSPatch
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/JingMatrix/LSPlant.git
+            target: ozsx/LSPlant
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/PerformanC/ReZygisk.git
+            target: ozsx/ReZygisk
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/KOWX712/PlayIntegrityFix.git
+            target: ozsx/PlayIntegrityFix_INJ
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+            
+
+    name: ${{ matrix.target }}
+    env:
+      SOURCE_URL: ${{ matrix.source }}
+      DEST_PATH: ${{ matrix.target }}
+      WITH_LFS: ${{ matrix.lfs }}
+      WITH_WIKI: ${{ matrix.wiki }}
+      WITH_WIKI_LFS: ${{ matrix.wiki_lfs }}
+      # Optional override: set wiki_source in one matrix entry when .wiki.git is not correct.
+      SOURCE_WIKI_URL: ${{ matrix.wiki_source || '' }}
+      CODEBERG_USERNAME: ${{ vars.CODEBERG_USERNAME }}
+      CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Git LFS if needed
+        shell: bash
+        run: |
+          if ! git lfs version >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y git-lfs
+          fi
+
+      - name: Sync repository, Wiki, and LFS safely
+        shell: bash
+        run: bash scripts/sync-repo.sh
