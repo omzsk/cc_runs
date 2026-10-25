@@ -174,6 +174,7 @@ jobs:
       WITH_LFS: ${{ matrix.lfs }}
       WITH_WIKI: ${{ matrix.wiki }}
       WITH_WIKI_LFS: ${{ matrix.wiki_lfs }}
+      CREATE_PRIVATE: 'true' # Set to 'false' if you want to create public repos on Codeberg.
       # Optional override: set wiki_source in one matrix entry when .wiki.git is not correct.
       SOURCE_WIKI_URL: ${{ matrix.wiki_source || '' }}
       CODEBERG_USERNAME: ${{ vars.CODEBERG_USERNAME }}
