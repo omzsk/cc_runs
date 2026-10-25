@@ -14,169 +14,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.repos.outputs.matrix }}
+    steps:
+      - name: Checkout repository list and scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read and validate repos
+        id: repos
+        run: python3 scripts/parse_repos.py repos
+
   mirror:
+    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Add more source/target pairs here. Targets must ALREADY exist on Codeberg.
-          # Public, HTTPS-clonable GitHub repository:
-          - source: https://github.com/R0rt1z2/kaeru.git
-            target: ozsx/kaeru
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/shomykohai/mtk-payloads.git
-            target: ozsx/mtk-payloads
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/shomykohai/penumbra.git
-            target: ozsx/penumbra
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/bkerler/mtkclient.git
-            target: ozsx/mtkclient
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://git.kaerulabs.com/shomy/preloader-mtk.git
-            target: ozsx/preloader-mtk
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/shomykohai/hacc.git
-            target: ozsx/hacc
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-          #######################################################
-          #######################################################
-          - source: https://github.com/tiann/KernelSU.git
-            target: ozsx/KernelSU
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/5ec1cff/KernelSU.git
-            target: ozsx/KernelSU_5ec1cff
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/backslashxx/KernelSU
-            target: ozsx/KernelSU_backslashxx
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/KOWX712/KernelSU.git
-            target: ozsx/KowSU
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/JingMatrix/KernelSU.git
-            target: ozsx/KernelSU_JMT
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/JingMatrix/NeoZygisk.git
-            target: ozsx/NeoZygisk
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/JingMatrix/TEESimulator.git
-            target: ozsx/TEESimulator
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/JingMatrix/Vector.git
-            target: ozsx/Vector
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/JingMatrix/LSPatch.git
-            target: ozsx/LSPatch
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/JingMatrix/LSPlant.git
-            target: ozsx/LSPlant
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/PerformanC/ReZygisk.git
-            target: ozsx/ReZygisk
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/KOWX712/PlayIntegrityFix.git
-            target: ozsx/PlayIntegrityFix_INJ
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          #######################################################
-          #######################################################
-
-          - source: https://github.com/eltavine/Duck-Detector-Refactoring.git
-            target: ozsx/Duck-Detector-Refactoring
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/eltavine/Duck-ToolBox.git
-            target: ozsx/Duck-ToolBox
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/KernelSU2/rustix.git
-            target: ozsx/rustix
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/5ec1cff/resetprop-rs.git
-            target: ozsx/resetprop-rs
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-          - source: https://github.com/5ec1cff/android_bootimg.git
-            target: ozsx/android_bootimg
-            wiki: true
-            lfs: true
-            wiki_lfs: true
-
-            
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     name: ${{ matrix.target }}
     env:
       SOURCE_URL: ${{ matrix.source }}
-      DEST_PATH: ${{ matrix.target }}
+      DEST_PATH: ${{ vars.CODEBERG_USERNAME }}/${{ matrix.target }}
       WITH_LFS: ${{ matrix.lfs }}
       WITH_WIKI: ${{ matrix.wiki }}
       WITH_WIKI_LFS: ${{ matrix.wiki_lfs }}
-      CREATE_PRIVATE: 'true' # Set to 'false' if you want to create public repos on Codeberg.
-      # Optional override: set wiki_source in one matrix entry when .wiki.git is not correct.
-      SOURCE_WIKI_URL: ${{ matrix.wiki_source || '' }}
+      CREATE_PRIVATE: ${{ matrix.private }}
       CODEBERG_USERNAME: ${{ vars.CODEBERG_USERNAME }}
       CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
 
@@ -187,6 +53,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Git LFS if needed
+        if: ${{ matrix.lfs || (matrix.wiki && matrix.wiki_lfs) }}
         shell: bash
         run: |
           if ! git lfs version >/dev/null 2>&1; then
@@ -194,6 +61,6 @@ jobs:
             sudo apt-get install -y git-lfs
           fi
 
-      - name: Sync repository, Wiki, and LFS safely
+      - name: Sync repository, Wiki, and LFS (one-way)
         shell: bash
         run: bash scripts/sync-repo.sh
