@@ -31,6 +31,8 @@ https://github.com/JingMatrix/LSPlant.git#wiki=1|lfs=1|wiki_lfs=1|private=0
 https://github.com/Seyud/device_faker.git#wiki=1|lfs=1|wiki_lfs=1|private=1
 https://github.com/Seyud/device_faker_config.git#wiki=1|lfs=1|wiki_lfs=1|private=1
 https://github.com/GJR787878/DeviceResetSpoofer.git#wiki=1|lfs=1|wiki_lfs=1|private=1
+https://github.com/BuSung-dev/SpoofMyDevice.git|lfs=1|wiki_lfs=1|private=1
+https://github.com/BuSung-dev/SpoofMyDevice_Devices.git|lfs=1|wiki_lfs=1|private=1
 
 # OTHERS
 https://github.com/R0rt1z2/kaeru.git#wiki=1|lfs=1|wiki_lfs=1|private=1
@@ -45,3 +47,14 @@ https://github.com/miner7222/LTBox.git#wiki=1|lfs=1|wiki_lfs=1|private=1
 https://github.com/ja7ad/hydra.git#wiki=1|lfs=1|wiki_lfs=1|private=0
 https://github.com/yunheshiguang/yunheshiguang-droid.git#wiki=1|lfs=1|wiki_lfs=1|private=0
 
+# ROOT
+https://github.com/NebuSec/CyberMeowfia.git#wiki=1|lfs=1|wiki_lfs=1|private=1
+https://github.com/JoinChang/ghostlock-oneplus.git#wiki=1|lfs=1|wiki_lfs=1|private=1
+https://github.com/diabl0w/DFRoot.git#wiki=1|lfs=1|wiki_lfs=1|private=1
+https://github.com/x-spy/CVE-2026-43499-popsicle.git#wiki=1|lfs=1|wiki_lfs=1|private=1
+https://github.com/BuSung-dev/Root-My-Galaxy.git#wiki=1|lfs=1|wiki_lfs=1|private=1
+https://github.com/quyicheng03-boop/xiaomi15-dada-cve-2026-64560.git#wiki=1|lfs=1|wiki_lfs=1|private=1
+
+https://github.com/SuperTurtleDev/gbl_root_canoe.git#wiki=1|lfs=1|wiki_lfs=1|private=1
+https://github.com/1vivy/gbl_root_canoe.git#wiki=1|lfs=1|wiki_lfs=1|private=1
+https://github.com/1vivy/gbl-chainload.git#wiki=1|lfs=1|wiki_lfs=1|private=1
