@@ -132,6 +132,39 @@ jobs:
             lfs: true
             wiki_lfs: true
 
+          #######################################################
+          #######################################################
+
+          - source: https://github.com/eltavine/Duck-Detector-Refactoring.git
+            target: ozsx/Duck-Detector-Refactoring
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/eltavine/Duck-ToolBox.git
+            target: ozsx/Duck-ToolBox
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/KernelSU2/rustix.git
+            target: ozsx/rustix
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/5ec1cff/resetprop-rs.git
+            target: ozsx/resetprop-rs
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
+          - source: https://github.com/5ec1cff/android_bootimg.git
+            target: ozsx/android_bootimg
+            wiki: true
+            lfs: true
+            wiki_lfs: true
+
             
 
     name: ${{ matrix.target }}
