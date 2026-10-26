@@ -119,11 +119,11 @@ ensure_repo_description() {
     notice 'Codeberg repository already has a description; leaving it unchanged.'
     return 0
   fi
-  jq -n --arg description "Backup of <$SOURCE_URL> by OZ" \
+  jq -n --arg description "Backup of $SOURCE_URL by OZ" \
     '{description:$description}' > "$WORK/repo-description.json"
   api_request PATCH "$repo_api_path" "$WORK/repo-description.json"
   api_expect 200 "Set description for $DEST_PATH"
-  notice "Set Codeberg repository description: Backup of <$SOURCE_URL> by OZ"
+  notice "Set Codeberg repository description: Backup of $SOURCE_URL by OZ"
 }
 
 # For a repo created in Codeberg, enable its Wiki and create a minimal Home
