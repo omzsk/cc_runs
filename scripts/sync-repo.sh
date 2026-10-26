@@ -115,19 +115,34 @@ ensure_repo_description() {
   [[ "$API_ENABLED" == true ]] || return 0
   load_repo
 
+  [[ -n "$SOURCE_URL" ]] || {
+    notice 'SOURCE_URL is empty; cannot update description.'
+    return 1
+  }
+
   local desc new_desc
   desc=$(jq -r '(.description // "") | gsub("^\\s+|\\s+$"; "")' \
     "$WORK/repo.json")
 
-  if [[ -n "$desc" && "$desc" == *"$SOURCE_URL"* ]]; then
-    notice 'Codeberg repository description already contains SOURCE_URL; leaving it unchanged.'
-    return 0
+  # Normalize URL placeholders and angle-bracket URLs.
+  new_desc=$(jq -nr \
+    --arg desc "$desc" \
+    --arg url "$SOURCE_URL" '
+      $desc
+      | split("<SOURCE_URL>") | join($url)
+      | split("<" + $url + ">") | join($url)
+    ')
+
+  if [[ -z "$new_desc" ]]; then
+    new_desc="Backup of $SOURCE_URL by OZ"
+  elif [[ "$new_desc" != *"$SOURCE_URL"* ]]; then
+    new_desc="$new_desc | Backup of $SOURCE_URL by OZ"
   fi
 
-  if [[ -z "$desc" ]]; then
-    new_desc="Backup of $SOURCE_URL by OZ"
-  else
-    new_desc="$desc | Backup of $SOURCE_URL by OZ"
+  # Skip API call if description is already correct.
+  if [[ "$new_desc" == "$desc" ]]; then
+    notice 'Codeberg repository description is already up to date.'
+    return 0
   fi
 
   jq -n --arg description "$new_desc" \
