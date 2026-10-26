@@ -114,13 +114,25 @@ ensure_repository() {
 ensure_repo_description() {
   [[ "$API_ENABLED" == true ]] || return 0
   load_repo
-  if jq -e '(.description // "") | gsub("^\\s+|\\s+$"; "") | length > 0' \
-    "$WORK/repo.json" >/dev/null; then
-    notice 'Codeberg repository already has a description; leaving it unchanged.'
+
+  # 1. Kiểm tra biến SOURCE_URL có dữ liệu hay không
+  if [[ -z "$SOURCE_URL" ]]; then
+    notice 'SOURCE_URL is empty, skipping description update.'
     return 0
   fi
+
+  # 2. Kiểm tra xem mô tả hiện tại đã có chứa SOURCE_URL hay chưa
+  if jq -e --arg url "$SOURCE_URL" '(.description // "") | contains($url)' \
+    "$WORK/repo.json" >/dev/null; then
+    notice 'Codeberg repository description already contains SOURCE_URL; leaving it unchanged.'
+    return 0
+  fi
+
+  # 3. Tiến hành cập nhật mô tả nếu chưa có SOURCE_URL
+  # Lưu ý: Bỏ bớt dấu < > quanh URL để tránh bị giao diện web API lọc bỏ thẻ HTML
   jq -n --arg description "Backup of $SOURCE_URL by OZ" \
-    '{description:$description}' > "$WORK/repo-description.json"
+    '{description: $description}' > "$WORK/repo-description.json"
+
   api_request PATCH "$repo_api_path" "$WORK/repo-description.json"
   api_expect 200 "Set description for $DEST_PATH"
   notice "Set Codeberg repository description: Backup of $SOURCE_URL by OZ"
