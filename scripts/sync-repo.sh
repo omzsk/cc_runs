@@ -110,6 +110,22 @@ ensure_repository() {
   notice "Created https://codeberg.org/$DEST_PATH"
 }
 
+# Set a description only when Codeberg does not already have one.
+ensure_repo_description() {
+  [[ "$API_ENABLED" == true ]] || return 0
+  load_repo
+  if jq -e '(.description // "") | gsub("^\\s+|\\s+$"; "") | length > 0' \
+    "$WORK/repo.json" >/dev/null; then
+    notice 'Codeberg repository already has a description; leaving it unchanged.'
+    return 0
+  fi
+  jq -n --arg description "Backup of <$SOURCE_URL> by OZ" \
+    '{description:$description}' > "$WORK/repo-description.json"
+  api_request PATCH "$repo_api_path" "$WORK/repo-description.json"
+  api_expect 200 "Set description for $DEST_PATH"
+  notice "Set Codeberg repository description: Backup of <$SOURCE_URL> by OZ"
+}
+
 # For a repo created in Codeberg, enable its Wiki and create a minimal Home
 # page when the separate wiki.git does not yet have any Git branches.
 ensure_wiki() {
@@ -219,6 +235,7 @@ mirror_git() (
 
   if [[ "$kind" == repository ]]; then
     ensure_repository
+    ensure_repo_description
   else
     ensure_wiki "$default"
   fi
