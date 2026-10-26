@@ -4,7 +4,7 @@
 One repo per line:
   https://github.com/R0rt1z2/kaeru.git#wiki=1|lfs=1|wiki_lfs=1|private=1
 
-Target name: kaeru_r0rt1z2 (repository case preserved, owner lowercased).
+Target name: kaeru_R0rt1z2 (repository and owner case preserved).
 Lines whose first non-space character is #, plus blank lines, are ignored.
 """
 
@@ -89,7 +89,6 @@ def parse_entry(raw: str, line_number: int) -> dict | None:
         missing = ", ".join(flag for flag in FLAGS if flag not in values)
         raise error(f"missing option(s): {missing}")
 
-    # target = f"{repo}_{owner.lower()}"
     target = f"{repo}_{owner}"
     # These exact keys are consumed by .github/workflows/sync.yml.
     return {"source": url, "target": target, **{flag: values[flag] for flag in FLAGS}}

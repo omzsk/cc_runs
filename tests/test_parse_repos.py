@@ -24,34 +24,33 @@ class ParseRepoTests(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
             return mod.parse_file(path)
 
-    def test_bundled_23_repos(self):
+    def test_bundled_48_repos(self):
         entries = mod.parse_file(ROOT / "repos")
-        self.assertEqual(len(entries), 23)
-        self.assertEqual(entries[0]["source"], "https://github.com/R0rt1z2/kaeru.git")
-        self.assertEqual(entries[0]["target"], "kaeru_r0rt1z2")
-        self.assertEqual(entries[6]["target"], "KernelSU_tiann")
-        self.assertEqual(entries[10]["target"], "KernelSU_jingmatrix")
-        self.assertEqual(entries[4]["target"], "preloader-mtk_shomy")
-        self.assertTrue(all(all(entry[k] for k in mod.FLAGS) for entry in entries))
+        self.assertEqual(len(entries), 48)
+        self.assertEqual(entries[0]["source"], "https://github.com/tiann/KernelSU.git")
+        self.assertEqual(entries[0]["target"], "KernelSU_tiann")
+        self.assertEqual(entries[4]["target"], "KernelSU_JingMatrix")
+        self.assertEqual(entries[-1]["target"], "LSPromise_LSPosed")
+        self.assertTrue(all(all(flag in e for flag in mod.FLAGS) for e in entries))
 
     def test_comments_blanks_crlf_and_flags(self):
         text = " # comment\r\n\r\nhttps://github.com/R0rt1z2/kaeru.git#wiki=0|lfs=1|wiki_lfs=0|private=0\r\n"
         entries = self.parse(text)
         self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["target"], "kaeru_r0rt1z2")
+        self.assertEqual(entries[0]["target"], "kaeru_R0rt1z2")
         self.assertEqual({k: entries[0][k] for k in mod.FLAGS},
                          {"wiki": False, "lfs": True, "wiki_lfs": False, "private": False})
 
     def test_options_any_order(self):
         entry = self.parse("https://git.example.com/OWNER/CamelCase#private=1|wiki_lfs=1|wiki=1|lfs=0\n")[0]
-        self.assertEqual(entry["target"], "CamelCase_owner")
+        self.assertEqual(entry["target"], "CamelCase_OWNER")
         self.assertFalse(entry["lfs"])
         self.assertTrue(entry["private"])
 
     def test_source_without_dot_git_and_all_false(self):
         entry = self.parse("https://git.example.com/AcCoUnT/repo#wiki=0|lfs=0|wiki_lfs=0|private=0\n")[0]
         self.assertEqual(entry["source"], "https://git.example.com/AcCoUnT/repo")
-        self.assertEqual(entry["target"], "repo_account")
+        self.assertEqual(entry["target"], "repo_AcCoUnT")
         self.assertFalse(any(entry[flag] for flag in mod.FLAGS))
 
     def test_bad_inputs(self):
@@ -86,9 +85,9 @@ class ParseRepoTests(unittest.TestCase):
             result = subprocess.run([sys.executable, str(PARSER), str(ROOT / "repos")],
                                     capture_output=True, text=True, env=env, check=True)
             self.assertEqual(result.stdout, "")
-            self.assertIn("Validated 23", result.stderr)
+            self.assertIn("Validated 48", result.stderr)
             matrix = json.loads(output.read_text().strip().removeprefix("matrix="))
-            self.assertEqual(len(matrix["include"]), 23)
+            self.assertEqual(len(matrix["include"]), 48)
 
 
 if __name__ == "__main__":

@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Mirror an HTTPS upstream repository (and optionally its Wiki) to Codeberg.
+# Mirror an HTTPS upstream repository (and optionally its Wiki) to GitLab.
 # Before replacing/deleting destination refs, archive their old Git objects as
 # immutable tags: refs/tags/__mirror_backup__/<run>/branches|tags/<name>.
 # Requires: Bash 4+, git, curl, jq; git-lfs only when LFS options are enabled.
-# NOTE: this is a one-way mirror. Never edit the Codeberg copy directly.
+# NOTE: this is a one-way mirror. Never edit the GitLab copy directly.
 set -euo pipefail
 
 : "${SOURCE_URL:?Required: SOURCE_URL (public HTTPS clone URL)}"
-: "${DEST_PATH:?Required: DEST_PATH (owner/repository)}"
-: "${CODEBERG_USERNAME:?Required: CODEBERG_USERNAME}"
-: "${CODEBERG_TOKEN:?Required: CODEBERG_TOKEN}"
+: "${DEST_PATH:?Required: DEST_PATH (namespace/repository)}"
+: "${GITLAB_TOKEN:?Required: GITLAB_TOKEN}"
+GITLAB_HOST="${GITLAB_HOST:-gitlab.com}"
 
 WITH_LFS="${WITH_LFS:-false}"
 WITH_WIKI="${WITH_WIKI:-false}"
 WITH_WIKI_LFS="${WITH_WIKI_LFS:-false}"
 CREATE_PRIVATE="${CREATE_PRIVATE:-false}"
 BACKUP_PREFIX='__mirror_backup__'
-API_URL='https://codeberg.org/api/v1'
+API_URL="https://${GITLAB_HOST}/api/v4"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 notice() { printf '%s\n' "$*" >&2; }
@@ -29,7 +29,8 @@ check_https_url() {
     fail 'Upstream HTTPS URL must not contain credentials or whitespace.'
 }
 
-[[ "$DEST_PATH" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "Invalid DEST_PATH: $DEST_PATH"
+[[ "$GITLAB_HOST" =~ ^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$ ]] || fail 'GITLAB_HOST must be a host name (optionally with port).'
+[[ "$DEST_PATH" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+$ ]] || fail "Invalid DEST_PATH: $DEST_PATH"
 for option in WITH_LFS WITH_WIKI WITH_WIKI_LFS CREATE_PRIVATE; do
   value="${!option}"
   [[ "$value" == true || "$value" == false ]] || fail "$option must be true or false"
@@ -46,22 +47,22 @@ umask 077
 cat > "$WORK/askpass" <<'ASKPASS'
 #!/usr/bin/env bash
 case "${1:-}" in
-  *Username*) printf '%s\n' "$CODEBERG_USERNAME" ;;
-  *Password*) printf '%s\n' "$CODEBERG_TOKEN" ;;
+  *Username*) printf '%s\n' "oauth2" ;;
+  *Password*) printf '%s\n' "$GITLAB_TOKEN" ;;
   *) exit 1 ;;
 esac
 ASKPASS
 chmod 700 "$WORK/askpass"
-printf 'Authorization: token %s\n' "$CODEBERG_TOKEN" > "$WORK/api-header"
+printf 'PRIVATE-TOKEN: %s\n' "$GITLAB_TOKEN" > "$WORK/api-header"
 
 # Credentials are NOT embedded in remote URLs or in shell command arguments.
-# Only operations explicitly wrapped in cb_git use the Codeberg askpass script.
-cb_git() { GIT_ASKPASS="$WORK/askpass" git "$@"; }
+# Only operations explicitly wrapped in dest_git use the GitLab askpass script.
+dest_git() { GIT_ASKPASS="$WORK/askpass" git "$@"; }
 export GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1
-TARGET_URL="${TARGET_URL_OVERRIDE:-https://codeberg.org/${DEST_PATH}.git}"
-TARGET_WIKI_URL="${TARGET_WIKI_URL_OVERRIDE:-https://codeberg.org/${DEST_PATH}.wiki.git}"
+TARGET_URL="${TARGET_URL_OVERRIDE:-https://${GITLAB_HOST}/${DEST_PATH}.git}"
+TARGET_WIKI_URL="${TARGET_WIKI_URL_OVERRIDE:-https://${GITLAB_HOST}/${DEST_PATH}.wiki.git}"
 # Local integration tests may supply file:// or pathname overrides; in this
-# mode no Codeberg API is called, and destination repositories must exist.
+# mode no GitLab API is called, and destination repositories must exist.
 API_ENABLED=true
 [[ -z "${TARGET_URL_OVERRIDE:-}" && -z "${TARGET_WIKI_URL_OVERRIDE:-}" ]] || API_ENABLED=false
 
@@ -83,123 +84,118 @@ api_expect() {
     fail "$action"
   fi
 }
-repo_api_path="repos/$DEST_PATH"
+# GitLab accepts numeric project IDs or URL-encoded namespace/path identifiers.
+urlencode() { jq -nr --arg value "$1" '$value|@uri'; }
+namespace="${DEST_PATH%/*}"
+project_name="${DEST_PATH##*/}"
+repo_api_path="projects/$(urlencode "$DEST_PATH")"
+PROJECT_CREATED=false
 load_repo() {
   api_request GET "$repo_api_path"
-  api_expect 200 "Read Codeberg repository $DEST_PATH"
+  api_expect 200 "Read GitLab project $DEST_PATH"
   cp "$WORK/api-response.json" "$WORK/repo.json"
 }
 ensure_repository() {
-  local owner="${DEST_PATH%%/*}" name="${DEST_PATH#*/}" endpoint
+  local namespace_id
   [[ "$API_ENABLED" == true ]] || return 0
   api_request GET "$repo_api_path"
   case "$API_STATUS" in
-    200) notice "Codeberg repository exists: $DEST_PATH"; return 0 ;;
-    404) notice "Creating Codeberg repository: $DEST_PATH" ;;
-    *) api_expect 200 'Check repository permissions' ;;
+    200) notice "GitLab project exists: $DEST_PATH"; return 0 ;;
+    404) notice "Creating GitLab project: $DEST_PATH" ;;
+    *) api_expect 200 'Check project permissions' ;;
   esac
-  if [[ "${owner,,}" == "${CODEBERG_USERNAME,,}" ]]; then
-    endpoint='user/repos'
-  else
-    endpoint="orgs/$owner/repos"
-  fi
-  jq -n --arg name "$name" --argjson private "$CREATE_PRIVATE" \
-    '{name:$name, private:$private, auto_init:false}' > "$WORK/create-repo.json"
-  api_request POST "$endpoint" "$WORK/create-repo.json"
-  api_expect 201 "Create repository $DEST_PATH (token must have create permission)"
-  notice "Created https://codeberg.org/$DEST_PATH"
+
+  api_request GET "namespaces/$(urlencode "$namespace")"
+  api_expect 200 "Look up GitLab namespace $namespace"
+  namespace_id="$(jq -r '.id // empty' "$WORK/api-response.json")"
+  [[ "$namespace_id" =~ ^[0-9]+$ ]] || fail "Invalid namespace ID for $namespace"
+
+  jq -n --arg name "$project_name" --arg path "$project_name" \
+    --argjson namespace_id "$namespace_id" --argjson private "$CREATE_PRIVATE" \
+    '{name:$name, path:$path, namespace_id:$namespace_id, visibility:(if $private then "private" else "public" end), initialize_with_readme:false, builds_access_level:"disabled", lfs_enabled:true}' \
+    > "$WORK/create-repo.json"
+  api_request POST 'projects' "$WORK/create-repo.json"
+  api_expect 201 "Create project $DEST_PATH (token requires api scope and create permission)"
+  PROJECT_CREATED=true
+  notice "Created https://${GITLAB_HOST}/$DEST_PATH"
 }
 
-# Set a description only when Codeberg does not already have one.
+# Set or add the original URL to the description, preserving previous user text.
 ensure_repo_description() {
   [[ "$API_ENABLED" == true ]] || return 0
   load_repo
-
-  [[ -n "$SOURCE_URL" ]] || {
-    notice 'SOURCE_URL is empty; cannot update description.'
-    return 1
-  }
-
   local desc new_desc
-  desc=$(jq -r '(.description // "") | gsub("^\\s+|\\s+$"; "")' \
-    "$WORK/repo.json")
-
-  # Normalize URLs and remove trailing "by OZ".
-  new_desc=$(jq -nr \
-    --arg desc "$desc" \
-    --arg url "$SOURCE_URL" '
-      $desc
-      | split("<SOURCE_URL>") | join($url)
-      | split("<" + $url + ">") | join($url)
-      | sub("\\s+by OZ\\s*$"; "")
-      | gsub("^\\s+|\\s+$"; "")
-    ')
-
-  # Ensure description contains SOURCE_URL.
+  desc=$(jq -r '(.description // "") | gsub("^\\s+|\\s+$"; "")' "$WORK/repo.json")
+  new_desc=$(jq -nr --arg desc "$desc" --arg url "$SOURCE_URL" '
+    $desc | split("<SOURCE_URL>") | join($url)
+    | split("<" + $url + ">") | join($url)
+    | sub("\\s+by OZ\\s*$"; "")
+    | gsub("^\\s+|\\s+$"; "")')
   if [[ -z "$new_desc" ]]; then
     new_desc="Backup of $SOURCE_URL"
   elif [[ "$new_desc" != *"$SOURCE_URL"* ]]; then
     new_desc="$new_desc | Backup of $SOURCE_URL"
   fi
-
-  # Skip API call if nothing changed.
-  if [[ "$new_desc" == "$desc" ]]; then
-    notice 'Codeberg repository description is already up to date.'
-    return 0
-  fi
-
-  jq -n --arg description "$new_desc" \
-    '{description:$description}' > "$WORK/repo-description.json"
-
-  api_request PATCH "$repo_api_path" "$WORK/repo-description.json"
-  api_expect 200 "Set description for $DEST_PATH"
-
-  notice "Set Codeberg repository description: $new_desc"
+  [[ "$new_desc" != "$desc" ]] || return 0
+  jq -n --arg description "$new_desc" '{description:$description}' > "$WORK/description.json"
+  api_request PUT "$repo_api_path" "$WORK/description.json"
+  api_expect 200 "Update description of $DEST_PATH"
+  notice "Updated GitLab project description."
 }
 
-# For a repo created in Codeberg, enable its Wiki and create a minimal Home
-# page when the separate wiki.git does not yet have any Git branches.
+# GitLab has a separate Wiki Git repository, initialized by creating a page.
+# Unlike Forgejo, GitLab does not expose a wiki_branch project setting.
 ensure_wiki() {
-  local wanted="$1" current_refs
+  local current_refs
   [[ "$API_ENABLED" == true ]] || return 0
   load_repo
-  if jq -e '.external_wiki != null' "$WORK/repo.json" >/dev/null; then
-    fail 'Destination uses an external Wiki; refusing to replace its configuration.'
+  if [[ "$(jq -r '.wiki_access_level // "enabled"' "$WORK/repo.json")" == disabled ]]; then
+    notice 'Enabling GitLab project Wiki...'
+    printf '{"wiki_access_level":"enabled"}\n' > "$WORK/wiki-settings.json"
+    api_request PUT "$repo_api_path" "$WORK/wiki-settings.json"
+    api_expect 200 'Enable project Wiki'
   fi
-  if [[ "$(jq -r '.has_wiki // false' "$WORK/repo.json")" != true ]]; then
-    notice 'Enabling Codeberg Wiki...'
-    printf '{"has_wiki":true}\n' > "$WORK/wiki-settings.json"
-    api_request PATCH "$repo_api_path" "$WORK/wiki-settings.json"
-    api_expect 200 'Enable Wiki'
-  fi
-
-  # Checking --heads (rather than HEAD) works with a repository whose HEAD is
-  # not yet advertised. Authentication failures must not be mistaken for empty.
-  if current_refs="$(cb_git ls-remote --heads "$TARGET_WIKI_URL" 2>"$WORK/wiki-ls-error")"; then
+  if current_refs="$(dest_git ls-remote --heads "$TARGET_WIKI_URL" 2>"$WORK/wiki-ls-error")"; then
     if [[ -n "$current_refs" ]]; then
       notice 'Destination Wiki already initialized.'
       return 0
     fi
   else
-    notice 'Wiki Git remote not initialized yet; trying Wiki creation API.'
+    notice 'Wiki Git remote not yet available; examining Wiki API.'
   fi
+  api_request GET "$repo_api_path/wikis"
+  api_expect 200 'List destination Wiki pages'
+  if [[ "$(jq -r 'length' "$WORK/api-response.json")" != 0 ]]; then
+    fail 'Wiki pages exist but Git Wiki remote is unavailable; refusing to overwrite it.'
+  fi
+  jq -n --arg content $'# Home\n\nPlaceholder page for backup initialization.\n' \
+    '{title:"home",content:$content,format:"markdown"}' > "$WORK/wiki-home.json"
+  api_request POST "$repo_api_path/wikis" "$WORK/wiki-home.json"
+  api_expect 201 'Initialize GitLab Wiki home page'
+  dest_git ls-remote --exit-code --heads "$TARGET_WIKI_URL" >/dev/null ||
+    fail 'Wiki API initialized a page but Wiki Git remote still has no branches.'
+}
 
-  # Set the Wiki branch BEFORE creating its first commit. Forgejo uses the
-  # configured Wiki branch when initializing its separate bare Git repo.
-  jq -n --arg branch "$wanted" '{wiki_branch:$branch}' > "$WORK/wiki-branch-init.json"
-  api_request PATCH "$repo_api_path" "$WORK/wiki-branch-init.json"
-  api_expect 200 'Configure initial Wiki branch'
-  notice 'Initializing Codeberg Wiki Home page via API...'
-  jq -n --arg body $'# Home\n\nInitial page for Wiki mirroring.\n' \
-    '{title:"Home",content_base64:($body|@base64),message:"Initialize Wiki for mirror"}' \
-    > "$WORK/wiki-home.json"
-  api_request POST "$repo_api_path/wiki/new" "$WORK/wiki-home.json"
+# GitLab may protect a newly created default branch after its first push.
+# A mirror needs to force-update rewritten upstream history. Only touch
+# protection on projects created by this workflow, not pre-existing projects.
+configure_new_project_force_push() {
+  local branch="$1" protected_path
+  [[ "$API_ENABLED" == true && "$PROJECT_CREATED" == true ]] || return 0
+  protected_path="$repo_api_path/protected_branches/$(urlencode "$branch")"
+  api_request GET "$protected_path"
   case "$API_STATUS" in
-    200|201) ;;
-    *) notice "Wiki initialization HTTP $API_STATUS:"; cat "$WORK/api-response.json" >&2; fail 'Initialize Wiki' ;;
+    404) return 0 ;;
+    200) ;;
+    *) api_expect 200 "Inspect protected branch $branch" ;;
   esac
-  cb_git ls-remote --exit-code --heads "$TARGET_WIKI_URL" >/dev/null ||
-    fail 'Wiki API succeeded but Wiki Git remote has no branches.'
+  if [[ "$(jq -r '.allow_force_push // false' "$WORK/api-response.json")" == true ]]; then
+    return 0
+  fi
+  notice "Allowing force pushes on new mirror's protected default branch: $branch"
+  printf '{"allow_force_push":true}\n' > "$WORK/force-push.json"
+  api_request PATCH "$protected_path" "$WORK/force-push.json"
+  api_expect 200 "Allow force push for $branch"
 }
 
 # Determine the source default HEAD ref; if missing, use the first source head.
@@ -213,22 +209,23 @@ source_default_branch() {
   fi
 }
 
-# After the desired branch has been pushed, change the branch shown by Codeberg
-# BEFORE trying to delete its previous default branch.
+# GitLab's regular project default branch is updated after pushing refs.
+# GitLab Wiki default branch cannot be changed with this API.
 set_destination_default() {
-  local kind="$1" wanted="$2" field current
-  [[ "$API_ENABLED" == true ]] || return 0
+  local kind="$1" wanted="$2" current
+  [[ "$API_ENABLED" == true && "$kind" == repository ]] || return 0
   load_repo
-  if [[ "$kind" == wiki ]]; then field='wiki_branch'; else field='default_branch'; fi
-  current="$(jq -r --arg field "$field" '.[$field] // ""' "$WORK/repo.json")"
-  if [[ "$wanted" == "$current" ]]; then return 0; fi
-  notice "Changing Codeberg $field from '${current:-<unset>}' to '$wanted'..."
-  jq -n --arg field "$field" --arg branch "$wanted" '{($field):$branch}' > "$WORK/default-branch.json"
-  api_request PATCH "$repo_api_path" "$WORK/default-branch.json"
-  api_expect 200 "Change $field to $wanted"
-  load_repo
-  current="$(jq -r --arg field "$field" '.[$field] // ""' "$WORK/repo.json")"
-  [[ "$current" == "$wanted" ]] || fail "Codeberg did not accept $field=$wanted"
+  current="$(jq -r '.default_branch // ""' "$WORK/repo.json")"
+  if [[ "$wanted" != "$current" ]]; then
+    notice "Changing GitLab default branch from '${current:-<unset>}' to '$wanted'..."
+    jq -n --arg branch "$wanted" '{default_branch:$branch}' > "$WORK/default-branch.json"
+    api_request PUT "$repo_api_path" "$WORK/default-branch.json"
+    api_expect 200 "Change default branch to $wanted"
+    load_repo
+    current="$(jq -r '.default_branch // ""' "$WORK/repo.json")"
+    [[ "$current" == "$wanted" ]] || fail "GitLab did not accept default_branch=$wanted"
+  fi
+  configure_new_project_force_push "$wanted"
 }
 
 # Push with an exact object-ID lease for EVERY destination ref, including new
@@ -236,7 +233,7 @@ set_destination_default() {
 # commits or tags which were not included in our backup snapshot.
 mirror_git() (
   local kind="$1" src="$2" dest="$3" lfs="$4"
-  local repo_dir="$WORK/${kind}.git" old new name ref archive current default
+  local repo_dir="$WORK/${kind}.git" old new name ref archive current default wiki_alias="" dest_head=""
   local stamp
   stamp="$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$-$RANDOM"
   local -a src_heads=() src_tags=() dst_heads=() dst_tags=()
@@ -248,7 +245,7 @@ mirror_git() (
   notice "::group::Mirror $kind: $src -> $dest"
   git clone --bare -- "$src" "$repo_dir"
   cd "$repo_dir"
-  git remote add codeberg "$dest"
+  git remote add destination "$dest"
   mapfile -t src_heads < <(git for-each-ref --format='%(refname)' refs/heads)
   (( ${#src_heads[@]} > 0 )) || fail "Upstream $kind has no branches. No destination refs changed."
   mapfile -t src_tags < <(git for-each-ref --format='%(refname)' refs/tags)
@@ -258,7 +255,7 @@ mirror_git() (
   default="$(source_default_branch)"
   notice "Upstream $kind default branch: $default"
 
-  # Download source LFS FIRST, before adding any Codeberg-only refs locally.
+  # Download source LFS FIRST, before adding any GitLab-only refs locally.
   if [[ "$lfs" == true ]]; then
     notice 'Fetching source LFS history...'
     git lfs fetch --all origin
@@ -271,9 +268,25 @@ mirror_git() (
     ensure_wiki "$default"
   fi
 
+  # GitLab Wiki's default branch cannot be selected via REST API. If source
+  # default differs and the source does not already have the Wiki's default
+  # branch, publish an extra alias pointing at source default for the UI.
+  # All upstream branches still retain their original refs.
+  if [[ "$kind" == wiki ]]; then
+    dest_head="$(dest_git ls-remote --symref destination HEAD | awk '$1 == "ref:" && $3 == "HEAD" {sub(/^refs\/heads\//, "", $2); print $2; exit}')"
+    if [[ -n "$dest_head" && "$dest_head" != "$default" ]]; then
+      if git show-ref -q --verify "refs/heads/$dest_head"; then
+        notice "::warning::Wiki default '$dest_head' collides with a source branch; GitLab Wiki UI will use '$dest_head', not upstream default '$default'."
+      else
+        wiki_alias="$dest_head"
+        notice "Mapping source Wiki default '$default' to GitLab Wiki default '$wiki_alias' as an additional alias."
+      fi
+    fi
+  fi
+
   # Fetch destination branches and tags into a separate namespace so source
   # refs remain untouched, including annotated tag objects.
-  cb_git fetch --no-tags codeberg \
+  dest_git fetch --no-tags destination \
     '+refs/heads/*:refs/destination/heads/*' \
     '+refs/tags/*:refs/destination/tags/*'
   while read -r ref old; do
@@ -295,13 +308,16 @@ mirror_git() (
     {
       for name in "${dst_heads[@]}"; do printf 'refs/destination/heads/%s\n' "$name"; done
       for name in "${dst_tags[@]}"; do printf 'refs/destination/tags/%s\n' "$name"; done
-    } | cb_git -c "lfs.url=${dest%/}/info/lfs" lfs fetch --all codeberg --stdin
+    } | dest_git -c "lfs.url=${dest%/}/info/lfs" lfs fetch --all destination --stdin
   fi
 
   # Archive changed/deleted destination branches, except fast-forwards.
   for name in "${dst_heads[@]}"; do
     old="${old_heads[$name]}"
-    if git show-ref -q --verify "refs/heads/$name"; then
+    if [[ "$name" == "$wiki_alias" ]]; then
+      new="$(git rev-parse "refs/heads/$default")"
+      if git merge-base --is-ancestor "$old" "$new"; then continue; fi
+    elif git show-ref -q --verify "refs/heads/$name"; then
       new="$(git rev-parse "refs/heads/$name")"
       if git merge-base --is-ancestor "$old" "$new"; then continue; fi
     fi
@@ -332,13 +348,13 @@ mirror_git() (
   # Upload LFS while live Git refs are still intact. With --all, active source
   # refs and newly created backup tags are included.
   if [[ "$lfs" == true ]]; then
-    notice 'Uploading source and archived LFS to Codeberg...'
-    cb_git -c "lfs.url=${dest%/}/info/lfs" lfs push --all codeberg
+    notice 'Uploading source and archived LFS to GitLab...'
+    dest_git -c "lfs.url=${dest%/}/info/lfs" lfs push --all destination
   fi
 
   # First publish immutable backup refs; never force-replace a prior backup.
   if (( ${#backup_specs[@]} > 0 )); then
-    cb_git push --atomic "${backup_leases[@]}" codeberg "${backup_specs[@]}"
+    dest_git push --atomic "${backup_leases[@]}" destination "${backup_specs[@]}"
   fi
 
   # Publish ALL desired upstream branches, safely leased to the snapshot.
@@ -348,7 +364,12 @@ mirror_git() (
     update_specs+=("+$ref:$ref")
     update_leases+=("--force-with-lease=$ref:${old_heads[$name]:-}")
   done
-  cb_git push --atomic "${update_leases[@]}" codeberg "${update_specs[@]}"
+  if [[ -n "$wiki_alias" ]]; then
+    ref="refs/heads/$wiki_alias"
+    update_specs+=("+refs/heads/$default:$ref")
+    update_leases+=("--force-with-lease=$ref:${old_heads[$wiki_alias]:-}")
+  fi
+  dest_git push --atomic "${update_leases[@]}" destination "${update_specs[@]}"
 
   # Changing the default is only possible after the wanted branch exists.
   set_destination_default "$kind" "$default"
@@ -356,11 +377,12 @@ mirror_git() (
   # Some forges may report a new default in their API while the bare Git
   # remote still advertises the old HEAD. Never attempt to delete that HEAD.
   local advertised_head
-  advertised_head="$(cb_git ls-remote --symref codeberg HEAD | awk '$1 == "ref:" && $3 == "HEAD" {sub(/^refs\/heads\//, "", $2); print $2; exit}')"
+  advertised_head="$(dest_git ls-remote --symref destination HEAD | awk '$1 == "ref:" && $3 == "HEAD" {sub(/^refs\/heads\//, "", $2); print $2; exit}')"
 
   # Prune only previous destination heads absent from the source.
   for name in "${dst_heads[@]}"; do
     if ! git show-ref -q --verify "refs/heads/$name"; then
+      [[ "$name" == "$wiki_alias" ]] && continue
       if [[ "$name" == "$advertised_head" ]]; then
         notice "::warning::Not deleting $kind/$name: destination Git HEAD still points to it."
         continue
@@ -385,7 +407,7 @@ mirror_git() (
     fi
   done
   if (( ${#delete_specs[@]} > 0 )); then
-    cb_git push --atomic "${delete_leases[@]}" codeberg "${delete_specs[@]}"
+    dest_git push --atomic "${delete_leases[@]}" destination "${delete_specs[@]}"
   fi
 
   notice "DONE: $kind, created $backups new immutable backup tag(s)."
