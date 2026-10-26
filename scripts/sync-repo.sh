@@ -124,22 +124,25 @@ ensure_repo_description() {
   desc=$(jq -r '(.description // "") | gsub("^\\s+|\\s+$"; "")' \
     "$WORK/repo.json")
 
-  # Normalize URL placeholders and angle-bracket URLs.
+  # Normalize URLs and remove trailing "by OZ".
   new_desc=$(jq -nr \
     --arg desc "$desc" \
     --arg url "$SOURCE_URL" '
       $desc
       | split("<SOURCE_URL>") | join($url)
       | split("<" + $url + ">") | join($url)
+      | sub("\\s+by OZ\\s*$"; "")
+      | gsub("^\\s+|\\s+$"; "")
     ')
 
+  # Ensure description contains SOURCE_URL.
   if [[ -z "$new_desc" ]]; then
-    new_desc="Backup of $SOURCE_URL by OZ"
+    new_desc="Backup of $SOURCE_URL"
   elif [[ "$new_desc" != *"$SOURCE_URL"* ]]; then
-    new_desc="$new_desc | Backup of $SOURCE_URL by OZ"
+    new_desc="$new_desc | Backup of $SOURCE_URL"
   fi
 
-  # Skip API call if description is already correct.
+  # Skip API call if nothing changed.
   if [[ "$new_desc" == "$desc" ]]; then
     notice 'Codeberg repository description is already up to date.'
     return 0
